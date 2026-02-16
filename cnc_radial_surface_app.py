@@ -17,6 +17,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.widgets import Button, CheckButtons, Slider, TextBox
 
+try:
+    import cnc_toolpath_accel as _accel  # type: ignore
+except Exception:
+    _accel = None
+
 
 @dataclass
 class CNCParameters:
@@ -48,6 +53,8 @@ class AppState:
     file_box: TextBox
     toggle: CheckButtons
     status_text: plt.Text
+    redraw_timer: object
+    redraw_pending: bool
 
 
 def polar_radius(
@@ -137,7 +144,9 @@ def _split_toolpath_segments(toolpath: np.ndarray) -> List[np.ndarray]:
     return [seg for seg in segments if seg.shape[0] >= 2]
 
 
-def generate_toolpath(params: CNCParameters) -> np.ndarray:
+def _generate_toolpath_python(
+    params: CNCParameters, offsets: np.ndarray | None = None
+) -> np.ndarray:
     """
     Generate constant-depth engraving contour(s) from periodic polar radius.
 
@@ -145,7 +154,8 @@ def generate_toolpath(params: CNCParameters) -> np.ndarray:
         Nx3 array with NaN separator rows between contour segments.
     """
     tool_radius = max(0.05, 0.5 * params.tool_diameter)
-    offsets = _build_radial_offsets(params)
+    if offsets is None:
+        offsets = _build_radial_offsets(params)
     cut_z = -abs(params.depth_offset) * max(0.01, params.z_scale)
 
     loops: List[np.ndarray] = []
@@ -181,6 +191,47 @@ def generate_toolpath(params: CNCParameters) -> np.ndarray:
             "Toolpath too dense (>220k points). Increase point spacing or step-over."
         )
     return result
+
+
+def _toolpath_backend_name() -> str:
+    return "C++" if _accel is not None else "Python"
+
+
+def generate_toolpath(params: CNCParameters) -> np.ndarray:
+    """
+    Generate constant-depth engraving contour(s) from periodic polar radius.
+
+    Returns:
+        Nx3 array with NaN separator rows between contour segments.
+    """
+    offsets = _build_radial_offsets(params)
+
+    if _accel is None:
+        return _generate_toolpath_python(params, offsets=offsets)
+
+    try:
+        path = _accel.generate_toolpath(
+            float(params.radius),
+            float(params.amplitude),
+            int(params.angular_frequency),
+            float(params.phase_shift),
+            float(params.tool_diameter),
+            float(params.depth_offset),
+            float(params.z_scale),
+            float(params.path_point_spacing),
+            np.asarray(offsets, dtype=np.float64),
+        )
+        path = np.asarray(path, dtype=np.float64)
+    except Exception:
+        path = _generate_toolpath_python(params, offsets=offsets)
+
+    if path.ndim != 2 or path.shape[1] != 3:
+        raise ValueError("Generated toolpath has an unexpected shape.")
+    if path.shape[0] > 220000:
+        raise ValueError(
+            "Toolpath too dense (>220k points). Increase point spacing or step-over."
+        )
+    return path
 
 
 def export_gcode(
@@ -243,6 +294,17 @@ def _radial_span(params: CNCParameters) -> Tuple[float, float]:
     return min(mins), max(maxs)
 
 
+def _decimate_for_plot(segment: np.ndarray, max_points: int = 1600) -> np.ndarray:
+    """Reduce display point count to keep interactive redraw fast."""
+    if segment.shape[0] <= max_points:
+        return segment
+    step = max(1, int(np.ceil(segment.shape[0] / max_points)))
+    sampled = segment[::step]
+    if not np.allclose(sampled[-1, :2], segment[-1, :2]):
+        sampled = np.vstack([sampled, segment[-1]])
+    return sampled
+
+
 def update_visualization(state: AppState) -> None:
     """Refresh flat stock mesh and optional contour engraving toolpath."""
     params = state.params
@@ -257,27 +319,28 @@ def update_visualization(state: AppState) -> None:
         linewidth=0.0,
         antialiased=True,
         alpha=0.45,
-        rcount=min(220, z.shape[0]),
-        ccount=min(220, z.shape[1]),
+        rcount=min(80, z.shape[0]),
+        ccount=min(100, z.shape[1]),
     )
 
     path = generate_toolpath(params)
     segments = _split_toolpath_segments(path)
     if params.show_toolpath:
         for segment in segments:
+            display_segment = _decimate_for_plot(segment)
             state.ax3d.plot(
-                segment[:, 0],
-                segment[:, 1],
-                segment[:, 2],
+                display_segment[:, 0],
+                display_segment[:, 1],
+                display_segment[:, 2],
                 color="black",
                 linewidth=1.2,
                 alpha=0.95,
             )
 
-    _, r_max = _radial_span(params)
+    r_min, r_max = _radial_span(params)
     span = max(10.0, r_max + params.tool_diameter + 2.0)
     cut_z = float(np.nanmin(path[:, 2]))
-    z_top = max(1.0, params.safe_height * 0.35)
+    z_top = max(1.0, abs(cut_z) + 0.8)
     z_bottom = min(cut_z - 0.5, -0.1)
 
     state.ax3d.set_xlim(-span, span)
@@ -290,10 +353,10 @@ def update_visualization(state: AppState) -> None:
     state.ax3d.set_zlabel("Z (mm)")
     state.ax3d.set_title("Planar Sinusoidal Polar Engraving")
 
-    r_min, r_max = _radial_span(params)
     points = sum(seg.shape[0] for seg in segments)
     state.status_text.set_text(
-        f"Passes: {len(segments)} | Points: {points} | r_min: {r_min:.2f} mm | r_max: {r_max:.2f} mm"
+        f"Passes: {len(segments)} | Points: {points} | r_min: {r_min:.2f} mm | "
+        f"r_max: {r_max:.2f} mm | Backend: {_toolpath_backend_name()}"
     )
     state.fig.canvas.draw_idle()
 
@@ -391,8 +454,24 @@ def main() -> None:
         file_box=file_box,
         toggle=toggle,
         status_text=status_text,
+        redraw_timer=None,
+        redraw_pending=False,
     )
     defaults = CNCParameters()
+    geometry_slider_keys = {
+        "radius",
+        "amplitude",
+        "angular_frequency",
+        "phase_shift",
+        "z_scale",
+        "tool_diameter",
+        "step_over",
+        "pass_count",
+        "depth_offset",
+        "path_point_spacing",
+        "mesh_radial_samples",
+        "mesh_angular_samples",
+    }
 
     def pull_params_from_widgets() -> None:
         p = state.params
@@ -413,7 +492,10 @@ def main() -> None:
         p.mesh_angular_samples = int(round(sliders["mesh_angular_samples"].val))
         p.output_filename = state.file_box.text.strip() or defaults.output_filename
 
-    def on_slider_change(_: float) -> None:
+    def perform_redraw() -> None:
+        if not state.redraw_pending:
+            return
+        state.redraw_pending = False
         pull_params_from_widgets()
         try:
             update_visualization(state)
@@ -421,13 +503,24 @@ def main() -> None:
             state.status_text.set_text(f"Parameter issue: {exc}")
             state.fig.canvas.draw_idle()
 
+    def schedule_redraw() -> None:
+        state.redraw_pending = True
+        state.redraw_timer.stop()
+        state.redraw_timer.start()
+
+    def on_slider_change(slider_key: str) -> None:
+        pull_params_from_widgets()
+        if slider_key in geometry_slider_keys:
+            schedule_redraw()
+            return
+        state.status_text.set_text(
+            f"Updated cutting settings | Backend: {_toolpath_backend_name()}"
+        )
+        state.fig.canvas.draw_idle()
+
     def on_toggle(_: str) -> None:
         state.params.show_toolpath = bool(state.toggle.get_status()[0])
-        try:
-            update_visualization(state)
-        except ValueError as exc:
-            state.status_text.set_text(f"Parameter issue: {exc}")
-            state.fig.canvas.draw_idle()
+        schedule_redraw()
 
     def on_file_submit(text: str) -> None:
         state.params.output_filename = text.strip() or defaults.output_filename
@@ -452,17 +545,22 @@ def main() -> None:
         state.params.show_toolpath = bool(state.toggle.get_status()[0])
         state.params.output_filename = defaults.output_filename
         state.file_box.set_val(defaults.output_filename)
-        update_visualization(state)
+        state.redraw_pending = True
+        perform_redraw()
 
-    for slider in sliders.values():
-        slider.on_changed(on_slider_change)
+    state.redraw_timer = fig.canvas.new_timer(interval=90)
+    state.redraw_timer.add_callback(perform_redraw)
+
+    for key, slider in sliders.items():
+        slider.on_changed(lambda _value, slider_key=key: on_slider_change(slider_key))
     toggle.on_clicked(on_toggle)
     file_box.on_submit(on_file_submit)
     export_btn.on_clicked(on_export)
     reset_btn.on_clicked(on_reset)
 
     pull_params_from_widgets()
-    update_visualization(state)
+    state.redraw_pending = True
+    perform_redraw()
     plt.show()
 
 
