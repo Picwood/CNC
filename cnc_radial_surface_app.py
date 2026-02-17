@@ -36,6 +36,7 @@ class CNCParameters:
     amplitude_attenuation: float = 0.0
     angular_frequency: int = 6
     phase_shift: float = 0.0
+    pass_phase_delta: float = 0.0
     z_scale: float = 1.0
     tool_diameter: float = 3.0
     step_over: float = 0.4
@@ -65,14 +66,18 @@ class AppState:
 
 
 def polar_radius(
-    theta: np.ndarray | float, params: CNCParameters, radial_offset: float = 0.0
+    theta: np.ndarray | float,
+    params: CNCParameters,
+    radial_offset: float = 0.0,
+    phase_shift_override: float | None = None,
 ) -> np.ndarray | float:
     """Periodic sinusoidal radius function in polar coordinates."""
     amplitude_eff = _effective_amplitude(params, radial_offset)
+    phase = params.phase_shift if phase_shift_override is None else phase_shift_override
     return (
         params.radius
         + radial_offset
-        + amplitude_eff * np.sin(params.angular_frequency * theta + params.phase_shift)
+        + amplitude_eff * np.sin(params.angular_frequency * theta + phase)
     )
 
 
@@ -110,7 +115,9 @@ def generate_surface(
     return x, y, z
 
 
-def _build_theta_samples(params: CNCParameters, radial_offset: float) -> np.ndarray:
+def _build_theta_samples(
+    params: CNCParameters, radial_offset: float, phase_shift: float
+) -> np.ndarray:
     """Adaptive theta sampling for near-constant XY point spacing."""
     spacing = max(0.05, params.path_point_spacing)
     theta_end = 2.0 * np.pi
@@ -119,11 +126,15 @@ def _build_theta_samples(params: CNCParameters, radial_offset: float) -> np.ndar
     theta_values = [0.0]
     theta = 0.0
     while theta < theta_end:
-        r = float(polar_radius(theta, params, radial_offset))
+        r = float(
+            polar_radius(
+                theta, params, radial_offset, phase_shift_override=float(phase_shift)
+            )
+        )
         dr_dtheta = (
             amplitude_eff
             * params.angular_frequency
-            * np.cos(params.angular_frequency * theta + params.phase_shift)
+            * np.cos(params.angular_frequency * theta + phase_shift)
         )
         ds_dtheta = np.sqrt(r * r + dr_dtheta * dr_dtheta)
         dtheta = np.clip(spacing / max(ds_dtheta, 1e-8), 0.0005, 0.2)
@@ -184,9 +195,12 @@ def _generate_toolpath_python(
     cut_z = -abs(params.depth_offset) * max(0.01, params.z_scale)
 
     loops: List[np.ndarray] = []
-    for offset in offsets:
-        theta = _build_theta_samples(params, float(offset))
-        r = polar_radius(theta, params, float(offset))
+    for pass_idx, offset in enumerate(offsets):
+        phase_local = params.phase_shift + pass_idx * params.pass_phase_delta
+        theta = _build_theta_samples(params, float(offset), float(phase_local))
+        r = polar_radius(
+            theta, params, float(offset), phase_shift_override=float(phase_local)
+        )
         r_min = float(np.min(r))
         if r_min <= tool_radius:
             raise ValueError(
@@ -243,6 +257,7 @@ def generate_toolpath(params: CNCParameters) -> np.ndarray:
             float(params.amplitude_attenuation),
             int(params.angular_frequency),
             float(params.phase_shift),
+            float(params.pass_phase_delta),
             float(params.tool_diameter),
             float(params.depth_offset),
             float(params.z_scale),
@@ -588,6 +603,7 @@ def export_catia_parameters(file_path: str | Path, params: CNCParameters) -> Pat
         f"amplitude_attenuation={params.amplitude_attenuation:.9f}",
         f"angular_frequency={int(params.angular_frequency)}",
         f"phase_shift={params.phase_shift:.12f}",
+        f"pass_phase_delta={params.pass_phase_delta:.12f}",
         f"step_over={params.step_over:.9f}",
         f"pass_count={int(params.pass_count)}",
         f"path_point_spacing={params.path_point_spacing:.9f}",
@@ -658,12 +674,13 @@ Sub CATMain()
     Dim factory2D
     Set factory2D = sketch.OpenEdition
 
-    Dim radius, amplitude, ampAtten, lobes, phaseShift, stepOver, passCount, pointSpacing
+    Dim radius, amplitude, ampAtten, lobes, phaseShift, passPhaseDelta, stepOver, passCount, pointSpacing
     radius = GetParamDouble(params, "radius", 35.0)
     amplitude = GetParamDouble(params, "amplitude", 6.0)
     ampAtten = GetParamDouble(params, "amplitude_attenuation", 0.0)
     lobes = CLng(GetParamDouble(params, "angular_frequency", 6.0))
     phaseShift = GetParamDouble(params, "phase_shift", 0.0)
+    passPhaseDelta = GetParamDouble(params, "pass_phase_delta", 0.0)
     stepOver = GetParamDouble(params, "step_over", 0.4)
     passCount = CLng(GetParamDouble(params, "pass_count", 1.0))
     pointSpacing = GetParamDouble(params, "path_point_spacing", 0.35)
@@ -682,6 +699,8 @@ Sub CATMain()
 
         Dim ampEff
         ampEff = EffectiveAmplitude(radius, amplitude, offset, ampAtten)
+        Dim phaseForPass
+        phaseForPass = phaseShift + passPhaseDelta * CDbl(i)
 
         Dim approxRadius
         approxRadius = radius + Abs(ampEff) + Abs(offset)
@@ -693,7 +712,7 @@ Sub CATMain()
         If nPts > 2500 Then nPts = 2500
 
         Dim poles
-        poles = BuildPoleArray(factory2D, radius, ampEff, lobes, phaseShift, offset, nPts, pi)
+        poles = BuildPoleArray(factory2D, radius, ampEff, lobes, phaseForPass, offset, nPts, pi)
 
         Dim spline
         Set spline = factory2D.CreateSpline(poles)
@@ -786,7 +805,7 @@ Function EffectiveAmplitude(radius, amplitude, offset, attenuation)
     EffectiveAmplitude = amplitude * (ratio ^ attenuation)
 End Function
 
-Function BuildPoleArray(factory2D, radius, amplitudeEff, lobes, phaseShift, offset, nPts, pi)
+Function BuildPoleArray(factory2D, radius, amplitudeEff, lobes, phaseForPass, offset, nPts, pi)
     Dim poles()
     ReDim poles(nPts)
 
@@ -794,7 +813,7 @@ Function BuildPoleArray(factory2D, radius, amplitudeEff, lobes, phaseShift, offs
     For j = 0 To nPts
         Dim theta, r, x, y
         theta = (2 * pi * CDbl(j)) / CDbl(nPts)
-        r = radius + offset + amplitudeEff * Sin(CDbl(lobes) * theta + phaseShift)
+        r = radius + offset + amplitudeEff * Sin(CDbl(lobes) * theta + phaseForPass)
         x = r * Cos(theta)
         y = r * Sin(theta)
         Set poles(j) = factory2D.CreatePoint(x, y)
@@ -1005,7 +1024,7 @@ def main() -> None:
     fig = plt.figure(figsize=(15, 9))
     ax3d = fig.add_axes([0.05, 0.08, 0.66, 0.86], projection="3d")
 
-    slider_y = np.linspace(0.89, 0.385, 14)
+    slider_y = np.linspace(0.89, 0.385, 15)
     sliders = {
         "radius": _build_slider(
             fig, (0.75, slider_y[0], 0.22, 0.022), "Mean Radius R (mm)", 5.0, 180.0, params.radius
@@ -1022,32 +1041,35 @@ def main() -> None:
         "phase_shift": _build_slider(
             fig, (0.75, slider_y[4], 0.22, 0.022), "Phase k (rad)", 0.0, 2.0 * np.pi, params.phase_shift
         ),
+        "pass_phase_delta": _build_slider(
+            fig, (0.75, slider_y[5], 0.22, 0.022), "Phase/Pass (rad)", -2.0 * np.pi, 2.0 * np.pi, params.pass_phase_delta
+        ),
         "z_scale": _build_slider(
-            fig, (0.75, slider_y[5], 0.22, 0.022), "Z Scale", 0.1, 4.0, params.z_scale
+            fig, (0.75, slider_y[6], 0.22, 0.022), "Z Scale", 0.1, 4.0, params.z_scale
         ),
         "tool_diameter": _build_slider(
-            fig, (0.75, slider_y[6], 0.22, 0.022), "Tool Dia (mm)", 0.2, 20.0, params.tool_diameter
+            fig, (0.75, slider_y[7], 0.22, 0.022), "Tool Dia (mm)", 0.2, 20.0, params.tool_diameter
         ),
         "step_over": _build_slider(
-            fig, (0.75, slider_y[7], 0.22, 0.022), "Step-over (mm)", 0.02, 5.0, params.step_over
+            fig, (0.75, slider_y[8], 0.22, 0.022), "Step-over (mm)", 0.02, 5.0, params.step_over
         ),
         "pass_count": _build_slider(
-            fig, (0.75, slider_y[8], 0.22, 0.022), "Passes", 1, 50, params.pass_count, 1
+            fig, (0.75, slider_y[9], 0.22, 0.022), "Passes", 1, 50, params.pass_count, 1
         ),
         "feed_rate": _build_slider(
-            fig, (0.75, slider_y[9], 0.22, 0.022), "Feed (mm/min)", 50.0, 8000.0, params.feed_rate
+            fig, (0.75, slider_y[10], 0.22, 0.022), "Feed (mm/min)", 50.0, 8000.0, params.feed_rate
         ),
         "spindle_speed": _build_slider(
-            fig, (0.75, slider_y[10], 0.22, 0.022), "Spindle (RPM)", 1000, 30000, params.spindle_speed, 100
+            fig, (0.75, slider_y[11], 0.22, 0.022), "Spindle (RPM)", 1000, 30000, params.spindle_speed, 100
         ),
         "safe_height": _build_slider(
-            fig, (0.75, slider_y[11], 0.22, 0.022), "Safe Z (mm)", 1.0, 60.0, params.safe_height
+            fig, (0.75, slider_y[12], 0.22, 0.022), "Safe Z (mm)", 1.0, 60.0, params.safe_height
         ),
         "depth_offset": _build_slider(
-            fig, (0.75, slider_y[12], 0.22, 0.022), "Engrave Depth (mm)", 0.02, 12.0, params.depth_offset
+            fig, (0.75, slider_y[13], 0.22, 0.022), "Engrave Depth (mm)", 0.02, 12.0, params.depth_offset
         ),
         "path_point_spacing": _build_slider(
-            fig, (0.75, slider_y[13], 0.22, 0.022), "Point Spacing (mm)", 0.05, 5.0, params.path_point_spacing
+            fig, (0.75, slider_y[14], 0.22, 0.022), "Point Spacing (mm)", 0.05, 5.0, params.path_point_spacing
         ),
     }
 
@@ -1097,6 +1119,7 @@ def main() -> None:
         "amplitude_attenuation",
         "angular_frequency",
         "phase_shift",
+        "pass_phase_delta",
         "z_scale",
         "tool_diameter",
         "step_over",
@@ -1114,6 +1137,7 @@ def main() -> None:
         p.amplitude_attenuation = float(sliders["amplitude_attenuation"].val)
         p.angular_frequency = int(round(sliders["angular_frequency"].val))
         p.phase_shift = float(sliders["phase_shift"].val)
+        p.pass_phase_delta = float(sliders["pass_phase_delta"].val)
         p.z_scale = float(sliders["z_scale"].val)
         p.tool_diameter = float(sliders["tool_diameter"].val)
         p.step_over = float(sliders["step_over"].val)

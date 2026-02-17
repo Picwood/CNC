@@ -24,6 +24,7 @@ py::array_t<double> generate_toolpath(
     double amplitude_attenuation,
     int angular_frequency,
     double phase_shift,
+    double pass_phase_delta,
     double tool_diameter,
     double depth_offset,
     double z_scale,
@@ -46,6 +47,7 @@ py::array_t<double> generate_toolpath(
 
     for (py::ssize_t oi = 0; oi < offsets.shape(0); ++oi) {
         const double offset = offsets(oi);
+        const double phase_local = phase_shift + static_cast<double>(oi) * pass_phase_delta;
         double amp_eff = amplitude;
         if (amplitude_attenuation > 0.0 && std::abs(radius) > 1e-9) {
             double ratio = (radius + offset) / radius;
@@ -59,7 +61,7 @@ py::array_t<double> generate_toolpath(
 
         double theta = 0.0;
         while (theta < kTwoPi) {
-            const double phase = static_cast<double>(angular_frequency) * theta + phase_shift;
+            const double phase = static_cast<double>(angular_frequency) * theta + phase_local;
             const double r = radius + offset + amp_eff * std::sin(phase);
             const double dr_dtheta =
                 amp_eff * static_cast<double>(angular_frequency) * std::cos(phase);
@@ -83,7 +85,7 @@ py::array_t<double> generate_toolpath(
             const double t = theta_values[ti];
             const double r = radius + offset +
                              amp_eff *
-                                 std::sin(static_cast<double>(angular_frequency) * t + phase_shift);
+                                 std::sin(static_cast<double>(angular_frequency) * t + phase_local);
             min_r = std::min(min_r, r);
 
             const double x = r * std::cos(t);
@@ -149,6 +151,7 @@ PYBIND11_MODULE(cnc_toolpath_accel, m) {
         py::arg("amplitude_attenuation"),
         py::arg("angular_frequency"),
         py::arg("phase_shift"),
+        py::arg("pass_phase_delta"),
         py::arg("tool_diameter"),
         py::arg("depth_offset"),
         py::arg("z_scale"),
