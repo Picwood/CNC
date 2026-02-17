@@ -1,0 +1,202 @@
+Option Explicit
+
+Sub CATMain()
+    Dim defaultParamFile
+    defaultParamFile = "C:\Users\Florian\Documents\GitHub\CNC\polar_engraving_catia_params.txt"
+
+    Dim paramFile
+    paramFile = defaultParamFile
+    If Not FileExists(paramFile) Then
+        paramFile = InputBox("Parameter file not found. Enter full path:", "CATIA Polar Spline Import", defaultParamFile)
+        If Len(Trim(paramFile)) = 0 Then
+            MsgBox "No parameter file provided."
+            Exit Sub
+        End If
+        If Not FileExists(paramFile) Then
+            MsgBox "Parameter file still not found: " & paramFile
+            Exit Sub
+        End If
+    End If
+
+    Dim params
+    Set params = LoadParams(paramFile)
+    If params Is Nothing Then
+        MsgBox "Unable to load parameters from: " & paramFile
+        Exit Sub
+    End If
+
+    If CATIA.Documents.Count = 0 Then
+        MsgBox "Open a CATPart document before running this macro."
+        Exit Sub
+    End If
+
+    Dim partDoc
+    Set partDoc = CATIA.ActiveDocument
+    If InStr(1, partDoc.Name, ".CATPart", 1) = 0 Then
+        MsgBox "Active document is not a CATPart."
+        Exit Sub
+    End If
+
+    Dim part
+    Set part = partDoc.Part
+    Dim body
+    Set body = part.MainBody
+
+    Dim originElements
+    Set originElements = part.OriginElements
+    Dim refPlane
+    Set refPlane = originElements.PlaneXY
+
+    Dim sketches
+    Set sketches = body.Sketches
+    Dim sketch
+    Set sketch = sketches.Add(refPlane)
+    sketch.Name = GetParamString(params, "sketch_name", "PolarSpline")
+
+    Dim factory2D
+    Set factory2D = sketch.OpenEdition
+
+    Dim radius, amplitude, ampAtten, lobes, phaseShift, stepOver, passCount, pointSpacing
+    radius = GetParamDouble(params, "radius", 35.0)
+    amplitude = GetParamDouble(params, "amplitude", 6.0)
+    ampAtten = GetParamDouble(params, "amplitude_attenuation", 0.0)
+    lobes = CLng(GetParamDouble(params, "angular_frequency", 6.0))
+    phaseShift = GetParamDouble(params, "phase_shift", 0.0)
+    stepOver = GetParamDouble(params, "step_over", 0.4)
+    passCount = CLng(GetParamDouble(params, "pass_count", 1.0))
+    pointSpacing = GetParamDouble(params, "path_point_spacing", 0.35)
+
+    If passCount < 1 Then passCount = 1
+    If pointSpacing < 0.01 Then pointSpacing = 0.01
+    If lobes < 1 Then lobes = 1
+
+    Dim pi
+    pi = 3.14159265358979
+
+    Dim i, j
+    For i = 0 To passCount - 1
+        Dim offset
+        offset = (CDbl(i) - 0.5 * CDbl(passCount - 1)) * stepOver
+
+        Dim ampEff
+        ampEff = EffectiveAmplitude(radius, amplitude, offset, ampAtten)
+
+        Dim approxRadius
+        approxRadius = radius + Abs(ampEff) + Abs(offset)
+        If approxRadius < 1.0 Then approxRadius = 1.0
+
+        Dim nPts
+        nPts = CLng((2 * pi * approxRadius) / pointSpacing)
+        If nPts < 80 Then nPts = 80
+        If nPts > 2500 Then nPts = 2500
+
+        Dim poles
+        poles = BuildPoleArray(factory2D, radius, ampEff, lobes, phaseShift, offset, nPts, pi)
+
+        Dim spline
+        Set spline = factory2D.CreateSpline(poles)
+    Next
+
+    sketch.CloseEdition
+    part.InWorkObject = sketch
+    part.Update
+
+    MsgBox "CATIA splines created from: " & paramFile
+End Sub
+
+Function FileExists(path)
+    Dim fso
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    FileExists = fso.FileExists(path)
+End Function
+
+Function LoadParams(path)
+    On Error Resume Next
+    Dim fso, ts
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    Set ts = fso.OpenTextFile(path, 1, False)
+    If Err.Number <> 0 Then
+        Set LoadParams = Nothing
+        Exit Function
+    End If
+
+    Dim dict
+    Set dict = CreateObject("Scripting.Dictionary")
+
+    Do Until ts.AtEndOfStream
+        Dim line, eqPos, key, value
+        line = Trim(ts.ReadLine)
+        If Len(line) > 0 Then
+            If Left(line, 1) <> "#" Then
+                eqPos = InStr(line, "=")
+                If eqPos > 1 Then
+                    key = LCase(Trim(Left(line, eqPos - 1)))
+                    value = Trim(Mid(line, eqPos + 1))
+                    If dict.Exists(key) Then
+                        dict.Item(key) = value
+                    Else
+                        dict.Add key, value
+                    End If
+                End If
+            End If
+        End If
+    Loop
+    ts.Close
+    Set LoadParams = dict
+End Function
+
+Function GetParamDouble(dict, key, defaultVal)
+    Dim k
+    k = LCase(key)
+    If dict.Exists(k) Then
+        On Error Resume Next
+        GetParamDouble = CDbl(dict.Item(k))
+        If Err.Number <> 0 Then
+            Err.Clear
+            GetParamDouble = defaultVal
+        End If
+        On Error GoTo 0
+    Else
+        GetParamDouble = defaultVal
+    End If
+End Function
+
+Function GetParamString(dict, key, defaultVal)
+    Dim k
+    k = LCase(key)
+    If dict.Exists(k) Then
+        GetParamString = CStr(dict.Item(k))
+    Else
+        GetParamString = defaultVal
+    End If
+End Function
+
+Function EffectiveAmplitude(radius, amplitude, offset, attenuation)
+    If attenuation <= 0 Or Abs(radius) < 0.000000001 Then
+        EffectiveAmplitude = amplitude
+        Exit Function
+    End If
+
+    Dim ratio
+    ratio = (radius + offset) / radius
+    If ratio < 0 Then ratio = 0
+    If ratio > 1 Then ratio = 1
+    EffectiveAmplitude = amplitude * (ratio ^ attenuation)
+End Function
+
+Function BuildPoleArray(factory2D, radius, amplitudeEff, lobes, phaseShift, offset, nPts, pi)
+    Dim poles()
+    ReDim poles(nPts)
+
+    Dim j
+    For j = 0 To nPts
+        Dim theta, r, x, y
+        theta = (2 * pi * CDbl(j)) / CDbl(nPts)
+        r = radius + offset + amplitudeEff * Sin(CDbl(lobes) * theta + phaseShift)
+        x = r * Cos(theta)
+        y = r * Sin(theta)
+        Set poles(j) = factory2D.CreatePoint(x, y)
+    Next
+
+    BuildPoleArray = poles
+End Function

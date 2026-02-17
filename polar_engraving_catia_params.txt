@@ -1,0 +1,10 @@
+# CATIA spline sketch import parameters (units: mm)
+radius=16.666666667
+amplitude=3.030303030
+amplitude_attenuation=1.563636364
+angular_frequency=10
+phase_shift=0.000000000000
+step_over=1.710181818
+pass_count=18
+path_point_spacing=0.350000000
+sketch_name=PolarSpline

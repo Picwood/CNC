@@ -21,6 +21,7 @@ double clamp_value(double value, double low, double high) {
 py::array_t<double> generate_toolpath(
     double radius,
     double amplitude,
+    double amplitude_attenuation,
     int angular_frequency,
     double phase_shift,
     double tool_diameter,
@@ -45,6 +46,13 @@ py::array_t<double> generate_toolpath(
 
     for (py::ssize_t oi = 0; oi < offsets.shape(0); ++oi) {
         const double offset = offsets(oi);
+        double amp_eff = amplitude;
+        if (amplitude_attenuation > 0.0 && std::abs(radius) > 1e-9) {
+            double ratio = (radius + offset) / radius;
+            ratio = clamp_value(ratio, 0.0, 1.0);
+            amp_eff = amplitude * std::pow(ratio, amplitude_attenuation);
+        }
+
         std::vector<double> theta_values;
         theta_values.reserve(4096);
         theta_values.push_back(0.0);
@@ -52,9 +60,9 @@ py::array_t<double> generate_toolpath(
         double theta = 0.0;
         while (theta < kTwoPi) {
             const double phase = static_cast<double>(angular_frequency) * theta + phase_shift;
-            const double r = radius + offset + amplitude * std::sin(phase);
+            const double r = radius + offset + amp_eff * std::sin(phase);
             const double dr_dtheta =
-                amplitude * static_cast<double>(angular_frequency) * std::cos(phase);
+                amp_eff * static_cast<double>(angular_frequency) * std::cos(phase);
             const double ds_dtheta = std::sqrt(r * r + dr_dtheta * dr_dtheta);
             const double dtheta =
                 clamp_value(spacing / std::max(ds_dtheta, 1e-8), 0.0005, 0.2);
@@ -74,7 +82,7 @@ py::array_t<double> generate_toolpath(
         for (std::size_t ti = 0; ti < theta_values.size(); ++ti) {
             const double t = theta_values[ti];
             const double r = radius + offset +
-                             amplitude *
+                             amp_eff *
                                  std::sin(static_cast<double>(angular_frequency) * t + phase_shift);
             min_r = std::min(min_r, r);
 
@@ -138,6 +146,7 @@ PYBIND11_MODULE(cnc_toolpath_accel, m) {
         &generate_toolpath,
         py::arg("radius"),
         py::arg("amplitude"),
+        py::arg("amplitude_attenuation"),
         py::arg("angular_frequency"),
         py::arg("phase_shift"),
         py::arg("tool_diameter"),
