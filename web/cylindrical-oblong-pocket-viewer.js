@@ -3,23 +3,22 @@ import { OrbitControls } from "https://esm.sh/three@0.179.1/examples/jsm/control
 
 const DEG_TO_RAD = Math.PI / 180;
 const TWO_PI = Math.PI * 2;
+const FIXED_SHAFT_DIAMETER = 35;
 
 const DEFAULT_PARAMS = {
-  shaftDiameter: 37,
+  shaftDiameter: FIXED_SHAFT_DIAMETER,
   pocketLength: 25,
   pocketEndRadius: 4,
   pocketDepth: 0.2,
   toolDiameter: 2,
   stepOver: 0.4,
   patternCount: 6,
-  patternStartAngle: 0,
-  axialCenter: 0,
+  pocketAxialOffset: 0,
+  pocketRelativeAxialOffset: 0,
   oblongAngleDeg: 0,
   pathPointSpacing: 0.35,
   meshAxialSamples: 280,
   meshAngularSamples: 420,
-  showToolpath: true,
-  showBoundaries: true,
   outerFinish: "matte",
   pocketFinish: "shiny",
 };
@@ -28,7 +27,6 @@ const CONTROL_SECTIONS = [
   {
     title: "Pocket Geometry",
     fields: [
-      ["shaftDiameter", "Shaft Diameter", 8, 180, 0.1, "mm"],
       ["pocketLength", "Pocket Length", 2, 120, 0.1, "mm"],
       ["pocketEndRadius", "End Radius", 0.8, 30, 0.05, "mm"],
       ["pocketDepth", "Pocket Depth", 0.01, 5, 0.01, "mm"],
@@ -38,17 +36,9 @@ const CONTROL_SECTIONS = [
     title: "Pattern Layout",
     fields: [
       ["patternCount", "Pocket Count", 1, 48, 1, ""],
-      ["patternStartAngle", "Start Angle", 0, 360, 0.5, "deg"],
-      ["axialCenter", "Axial Center", -120, 120, 0.1, "mm"],
+      ["pocketAxialOffset", "Pocket Axial Offset", -120, 120, 0.1, "mm"],
+      ["pocketRelativeAxialOffset", "Relative Axial Offset", -40, 40, 0.1, "mm"],
       ["oblongAngleDeg", "Oblong Axis", -90, 90, 0.25, "deg"],
-    ],
-  },
-  {
-    title: "Toolpath Overlay",
-    fields: [
-      ["toolDiameter", "Tool Diameter", 0.4, 20, 0.05, "mm"],
-      ["stepOver", "Step-Over", 0.02, 4, 0.01, "mm"],
-      ["pathPointSpacing", "Path Spacing", 0.05, 5, 0.01, "mm"],
     ],
   },
 ];
@@ -60,6 +50,22 @@ const FINISH_OPTIONS = [
 
 function cloneParams(params) {
   return structuredClone(params);
+}
+
+function normalizeLockedParams(params) {
+  const hasRelativeOffset = Object.prototype.hasOwnProperty.call(params, "pocketRelativeAxialOffset");
+  const hasAbsoluteOffset = Object.prototype.hasOwnProperty.call(params, "pocketAxialOffset");
+  const legacyRelativeOffset = hasAbsoluteOffset && !hasRelativeOffset ? params.pocketAxialOffset : undefined;
+
+  return {
+    ...params,
+    shaftDiameter: FIXED_SHAFT_DIAMETER,
+    patternCount: Math.max(1, Math.round(params.patternCount ?? DEFAULT_PARAMS.patternCount)),
+    pocketAxialOffset: hasRelativeOffset ? (params.pocketAxialOffset ?? DEFAULT_PARAMS.pocketAxialOffset) : DEFAULT_PARAMS.pocketAxialOffset,
+    pocketRelativeAxialOffset: hasRelativeOffset
+      ? (params.pocketRelativeAxialOffset ?? DEFAULT_PARAMS.pocketRelativeAxialOffset)
+      : (legacyRelativeOffset ?? DEFAULT_PARAMS.pocketRelativeAxialOffset),
+  };
 }
 
 function degToRad(value) {
@@ -277,6 +283,23 @@ function validateGeometry(params) {
   }
 }
 
+function computePocketPlacements(params) {
+  const count = Math.max(1, Math.round(params.patternCount));
+  const shaftRadius = 0.5 * params.shaftDiameter;
+  const firstShift = -0.5 * (count - 1) * params.pocketRelativeAxialOffset;
+  const out = [];
+
+  for (let idx = 0; idx < count; idx += 1) {
+    out.push({
+      index: idx,
+      angleDeg: (360 * idx) / count,
+      sCenter: shaftRadius * degToRad((360 * idx) / count),
+      axialShift: params.pocketAxialOffset + firstShift + idx * params.pocketRelativeAxialOffset,
+    });
+  }
+  return out;
+}
+
 function generateSinglePocketToolpath(params) {
   validateGeometry(params);
   const toolRadius = 0.5 * params.toolDiameter;
@@ -305,22 +328,14 @@ function generateSinglePocketToolpath(params) {
   }
 
   segment = rotateXSPath(segment, params.oblongAngleDeg);
-  return segment.map(([x, s, z]) => [x + params.axialCenter, s, z]);
+  return segment;
 }
 
 function generateToolpathSegments(params) {
   const baseSegment = generateSinglePocketToolpath(params);
-  const shaftRadius = 0.5 * params.shaftDiameter;
-  const count = Math.max(1, Math.round(params.patternCount));
-  const segments = [];
-
-  for (let idx = 0; idx < count; idx += 1) {
-    const angleDeg = params.patternStartAngle + (360 * idx) / count;
-    const sOffset = shaftRadius * degToRad(angleDeg);
-    segments.push(baseSegment.map(([x, s, z]) => [x, s + sOffset, z]));
-  }
-
-  return segments;
+  return computePocketPlacements(params).map((placement) =>
+    baseSegment.map(([x, s, z]) => [x + placement.axialShift, s + placement.sCenter, z]),
+  );
 }
 
 function singlePocketBoundary(params) {
@@ -330,22 +345,15 @@ function singlePocketBoundary(params) {
   const spacing = Math.max(0.05, perimeter / Math.max(40, 160));
   const loop = sampleObroundLoop(radius, straightHalfLen, 0, spacing);
   const boundary = rotateXSBoundary(loop.map(([x, s]) => [x, s]), params.oblongAngleDeg);
-  return boundary.map(([x, s]) => [x + params.axialCenter, s]);
+  return boundary;
 }
 
 function patternBoundaries(params) {
   validateGeometry(params);
   const baseBoundary = singlePocketBoundary(params);
-  const shaftRadius = 0.5 * params.shaftDiameter;
-  const count = Math.max(1, Math.round(params.patternCount));
-  const boundaries = [];
-
-  for (let idx = 0; idx < count; idx += 1) {
-    const angleDeg = params.patternStartAngle + (360 * idx) / count;
-    const sOffset = shaftRadius * degToRad(angleDeg);
-    boundaries.push(baseBoundary.map(([x, s]) => [x, s + sOffset]));
-  }
-  return boundaries;
+  return computePocketPlacements(params).map((placement) =>
+    baseBoundary.map(([x, s]) => [x + placement.axialShift, s + placement.sCenter]),
+  );
 }
 
 function spiralLevelCount(params) {
@@ -364,20 +372,20 @@ function pointInsidePocketLocal(localX, localS, params) {
   return Math.hypot(localX - capCenterX, localS) <= radius + 1e-9;
 }
 
-function pointInsidePocketWorld(x, s, params, sCenter, circumference) {
+function pointInsidePocketWorld(x, s, params, placement, circumference) {
   const angleRad = degToRad(params.oblongAngleDeg);
   const c = Math.cos(angleRad);
   const sinAngle = Math.sin(angleRad);
-  const dx = x - params.axialCenter;
-  const ds = wrapArcLength(s - sCenter, circumference);
+  const dx = x - placement.axialShift;
+  const ds = wrapArcLength(s - placement.sCenter, circumference);
   const localX = c * dx + sinAngle * ds;
   const localS = -sinAngle * dx + c * ds;
   return pointInsidePocketLocal(localX, localS, params);
 }
 
-function pointInsideAnyPocket(x, s, params, sCenters, circumference) {
-  for (const sCenter of sCenters) {
-    if (pointInsidePocketWorld(x, s, params, sCenter, circumference)) {
+function pointInsideAnyPocket(x, s, params, placements, circumference) {
+  for (const placement of placements) {
+    if (pointInsidePocketWorld(x, s, params, placement, circumference)) {
       return true;
     }
   }
@@ -385,14 +393,7 @@ function pointInsideAnyPocket(x, s, params, sCenters, circumference) {
 }
 
 function computePocketCenters(params) {
-  const count = Math.max(1, Math.round(params.patternCount));
-  const shaftRadius = 0.5 * params.shaftDiameter;
-  const out = [];
-  for (let idx = 0; idx < count; idx += 1) {
-    const angleDeg = params.patternStartAngle + (360 * idx) / count;
-    out.push(shaftRadius * degToRad(angleDeg));
-  }
-  return out;
+  return computePocketPlacements(params).map((placement) => placement.sCenter);
 }
 
 function computeBoundaryBounds(boundary) {
@@ -526,17 +527,22 @@ function chooseSecondaryOuterSeam(holeIntervals, seamStart, circumference) {
 
 // CAD-like source model: explicit cylindrical floor/outer surfaces plus radial walls.
 function buildParametricPocketPart(params) {
-  validateGeometry(params);
+  const partParams = normalizeLockedParams(cloneParams(params));
+  validateGeometry(partParams);
 
-  const partParams = cloneParams(params);
   const shaftRadius = 0.5 * partParams.shaftDiameter;
   const floorRadius = shaftRadius - partParams.pocketDepth;
   const circumference = TWO_PI * shaftRadius;
   const xMargin = Math.max(6, 0.35 * partParams.pocketLength);
-  const xMin = partParams.axialCenter - 0.5 * partParams.pocketLength - xMargin;
-  const xMax = partParams.axialCenter + 0.5 * partParams.pocketLength + xMargin;
-  const pocketCenters = computePocketCenters(partParams);
+  const pocketPlacements = computePocketPlacements(partParams);
+  const pocketCenters = pocketPlacements.map((placement) => placement.sCenter);
   const boundaries = patternBoundaries(partParams);
+  const relativeBoundaryBounds = boundaries.map((boundary) => {
+    const shiftedBoundary = boundary.map(([x, s]) => [x - partParams.pocketAxialOffset, s]);
+    return computeBoundaryBounds(shiftedBoundary);
+  });
+  const xMin = Math.min(...relativeBoundaryBounds.map((bounds) => bounds.xMin)) - xMargin;
+  const xMax = Math.max(...relativeBoundaryBounds.map((bounds) => bounds.xMax)) + xMargin;
   const seamStart = chooseBackFacingOuterSeam(
     boundaries,
     pocketCenters,
@@ -548,13 +554,15 @@ function buildParametricPocketPart(params) {
     const bounds = computeBoundaryBounds(boundary);
     return {
       kind: "pocket",
-      centerS: pocketCenters[idx],
+      centerS: pocketPlacements[idx].sCenter,
+      axialShift: pocketPlacements[idx].axialShift,
       boundary,
       floorSurface: {
         kind: "trimmed-cylinder",
         role: "floor",
         radius: floorRadius,
-        centerS: pocketCenters[idx],
+        centerS: pocketPlacements[idx].sCenter,
+        axialShift: pocketPlacements[idx].axialShift,
         boundary,
         xMin: bounds.xMin,
         xMax: bounds.xMax,
@@ -604,6 +612,7 @@ function buildParametricPocketPart(params) {
     shaftRadius,
     floorRadius,
     circumference,
+    pocketPlacements,
     pocketCenters,
     xRange: { min: xMin, max: xMax },
     outerSurfaces,
@@ -882,8 +891,14 @@ function meshTrimmedCylinderSurface(surface, part) {
     for (let xIdx = 0; xIdx < xSegments; xIdx += 1) {
       const xMid = surface.xMin + (surface.xMax - surface.xMin) * ((xIdx + 0.5) / xSegments);
       const includeCell = surface.role === "outer"
-        ? !pointInsideAnyPocket(xMid, sMid, params, part.pocketCenters, part.circumference)
-        : pointInsidePocketWorld(xMid, sMid, params, surface.centerS, part.circumference);
+        ? !pointInsideAnyPocket(xMid, sMid, params, part.pocketPlacements, part.circumference)
+        : pointInsidePocketWorld(
+          xMid,
+          sMid,
+          params,
+          { sCenter: surface.centerS, axialShift: surface.axialShift ?? 0 },
+          part.circumference,
+        );
       if (!includeCell) {
         continue;
       }
@@ -1192,7 +1207,7 @@ class CylindricalOblongPocketViewer extends HTMLElement {
   }
 
   set params(nextParams) {
-    this._params = { ...this._params, ...nextParams };
+    this._params = normalizeLockedParams({ ...this._params, ...nextParams });
     this._syncInputsFromParams();
     this._scheduleRebuild();
   }
@@ -1301,28 +1316,20 @@ class CylindricalOblongPocketViewer extends HTMLElement {
           line-height: 1.5;
         }
 
-        .panel-section,
-        .stats,
-        .toggles {
+        .panel-section {
           padding: 16px;
           border-radius: 18px;
           background: var(--card-bg);
           border: 1px solid var(--line);
         }
 
-        .section-kicker,
-        .stats-title {
+        .section-kicker {
           display: block;
           margin-bottom: 12px;
           color: #ffd5ba;
           font-size: 12px;
           letter-spacing: 0.11em;
           text-transform: uppercase;
-        }
-
-        .stats-title {
-          grid-column: 1 / -1;
-          margin-bottom: 0;
         }
 
         .control {
@@ -1381,52 +1388,6 @@ class CylindricalOblongPocketViewer extends HTMLElement {
 
         .control-body.single {
           grid-template-columns: 1fr;
-        }
-
-        .toggles {
-          display: grid;
-          gap: 12px;
-        }
-
-        .toggle {
-          display: flex;
-          align-items: center;
-          justify-content: space-between;
-          gap: 12px;
-          color: #d7e0e7;
-          font-size: 14px;
-        }
-
-        input[type="checkbox"] {
-          inline-size: 18px;
-          block-size: 18px;
-          accent-color: var(--accent);
-        }
-
-        .stats {
-          display: grid;
-          grid-template-columns: repeat(2, minmax(0, 1fr));
-          gap: 10px 14px;
-        }
-
-        .stat {
-          display: grid;
-          gap: 2px;
-        }
-
-        .stat dt {
-          margin: 0;
-          color: #8ca0af;
-          font-size: 12px;
-          text-transform: uppercase;
-          letter-spacing: 0.08em;
-        }
-
-        .stat dd {
-          margin: 0;
-          font-size: 17px;
-          font-weight: 600;
-          letter-spacing: -0.03em;
         }
 
         .viewport-wrap {
@@ -1529,8 +1490,7 @@ class CylindricalOblongPocketViewer extends HTMLElement {
             padding: 16px;
           }
 
-          .control-body,
-          .stats {
+          .control-body {
             grid-template-columns: 1fr;
           }
 
@@ -1551,17 +1511,6 @@ class CylindricalOblongPocketViewer extends HTMLElement {
             </p>
 
             ${sectionMarkup}
-
-            <section class="toggles">
-              <label class="toggle">
-                <span>Show pocket boundaries</span>
-                <input data-kind="toggle" data-key="showBoundaries" type="checkbox">
-              </label>
-              <label class="toggle">
-                <span>Show spiral toolpath</span>
-                <input data-kind="toggle" data-key="showToolpath" type="checkbox">
-              </label>
-            </section>
 
             <section class="panel-section">
               <div class="section-kicker">Surface Finish</div>
@@ -1587,26 +1536,6 @@ class CylindricalOblongPocketViewer extends HTMLElement {
                   </select>
                 </div>
               </label>
-            </section>
-
-            <section class="stats">
-              <span class="stats-title">Live Metrics</span>
-              <dl class="stat">
-                <dt>Pockets</dt>
-                <dd data-metric="pockets">-</dd>
-              </dl>
-              <dl class="stat">
-                <dt>Spiral Levels</dt>
-                <dd data-metric="spiralLevels">-</dd>
-              </dl>
-              <dl class="stat">
-                <dt>Circumference Pitch</dt>
-                <dd data-metric="pitch">-</dd>
-              </dl>
-              <dl class="stat">
-                <dt>Pocket Span</dt>
-                <dd data-metric="span">-</dd>
-              </dl>
             </section>
           </div>
 
@@ -1645,7 +1574,7 @@ class CylindricalOblongPocketViewer extends HTMLElement {
     this._controls.enableDamping = true;
     this._controls.minDistance = 12;
     this._controls.maxDistance = 1200;
-    this._controls.target.set(this._params.axialCenter, 0, 0);
+    this._controls.target.set(0, 0, 0);
 
     const hemi = new THREE.HemisphereLight(0xb8d8ff, 0x0a0e13, 1.4);
     const key = new THREE.DirectionalLight(0xffffff, 2.2);
@@ -1677,14 +1606,6 @@ class CylindricalOblongPocketViewer extends HTMLElement {
         this._inputs.set(key, {});
       }
       this._inputs.get(key)[input.dataset.kind] = input;
-
-      if (input.dataset.kind === "toggle") {
-        input.addEventListener("change", () => {
-          this._params[key] = input.checked;
-          this._scheduleRebuild();
-        });
-        return;
-      }
 
       if (input.dataset.kind === "select") {
         input.addEventListener("change", () => {
@@ -1740,9 +1661,6 @@ class CylindricalOblongPocketViewer extends HTMLElement {
       if (pair.number) {
         pair.number.value = String(this._params[key]);
       }
-      if (pair.toggle) {
-        pair.toggle.checked = Boolean(this._params[key]);
-      }
       if (pair.select) {
         pair.select.value = String(this._params[key]);
       }
@@ -1783,7 +1701,6 @@ class CylindricalOblongPocketViewer extends HTMLElement {
       this._clearModelGroup();
 
       const cadPart = buildParametricPocketPart(this._params);
-      const shaftRadius = cadPart.shaftRadius;
       const materials = {
         outer: buildFinishMaterial("outer", this._params.outerFinish),
         floor: buildFinishMaterial("pocket", this._params.pocketFinish),
@@ -1796,21 +1713,6 @@ class CylindricalOblongPocketViewer extends HTMLElement {
         this._modelGroup.add(mesh);
       });
 
-      if (this._params.showBoundaries) {
-        patternBoundaries(this._params).forEach((boundary) => {
-          const points = boundary.map((point) => boundaryToCylinderPoint(point, shaftRadius));
-          this._modelGroup.add(makeLine(points, 0xffa25e, true));
-        });
-      }
-
-      if (this._params.showToolpath) {
-        generateToolpathSegments(this._params).forEach((segment) => {
-          const points = segment.map((point) => unwrapToCylinderPoint(point, shaftRadius, 0.03));
-          this._modelGroup.add(makeLine(points, 0x5cc8ff, false));
-        });
-      }
-
-      this._updateMetrics();
       this._frameView();
       status.classList.remove("error");
       statusText.textContent = `Parametric pocket shaft rebuilt as ${cadPart.outerSurfaces.length + cadPart.endCaps.length + cadPart.pockets.length * 2} analytic surfaces, then meshed for display.`;
@@ -1827,24 +1729,13 @@ class CylindricalOblongPocketViewer extends HTMLElement {
     }
   }
 
-  _updateMetrics() {
-    const count = Math.max(1, Math.round(this._params.patternCount));
-    const circumference = Math.PI * this._params.shaftDiameter;
-    const pitch = circumference / count;
-    const span = estimateMaxCircumferentialSpan(this._params);
-    const spiralLevels = spiralLevelCount(this._params);
-
-    this.shadowRoot.querySelector('[data-metric="pockets"]').textContent = String(count);
-    this.shadowRoot.querySelector('[data-metric="spiralLevels"]').textContent = String(spiralLevels);
-    this.shadowRoot.querySelector('[data-metric="pitch"]').textContent = `${formatValue(pitch, 2)} mm`;
-    this.shadowRoot.querySelector('[data-metric="span"]').textContent = `${formatValue(span, 2)} mm`;
-  }
-
   _frameView() {
     const shaftRadius = 0.5 * this._params.shaftDiameter;
-    const visibleLength = this._params.pocketLength + 2 * Math.max(6, 0.35 * this._params.pocketLength);
-    const targetX = this._params.axialCenter;
-    this._controls.target.set(targetX, 0, 0);
+    const visibleLength = this._params.pocketLength
+      + Math.abs(this._params.pocketRelativeAxialOffset) * Math.max(0, Math.round(this._params.patternCount) - 1)
+      + 2 * Math.max(6, 0.35 * this._params.pocketLength);
+    const targetX = 0;
+    this._controls.target.set(0, 0, 0);
 
     if (this._firstFrame) {
       this._camera.position.set(
