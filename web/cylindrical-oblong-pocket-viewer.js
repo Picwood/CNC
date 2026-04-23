@@ -20,6 +20,8 @@ const DEFAULT_PARAMS = {
   meshAngularSamples: 420,
   showToolpath: true,
   showBoundaries: true,
+  outerFinish: "matte",
+  pocketFinish: "shiny",
 };
 
 const CONTROL_SECTIONS = [
@@ -49,6 +51,11 @@ const CONTROL_SECTIONS = [
       ["pathPointSpacing", "Path Spacing", 0.05, 5, 0.01, "mm"],
     ],
   },
+];
+
+const FINISH_OPTIONS = [
+  { value: "matte", label: "Matte" },
+  { value: "shiny", label: "Shiny" },
 ];
 
 function cloneParams(params) {
@@ -428,6 +435,52 @@ function chooseOuterSurfaceSeam(pocketCenters, circumference) {
   return seam % circumference;
 }
 
+function circularDistance(valueA, valueB, period) {
+  const delta = Math.abs(valueA - valueB) % period;
+  return Math.min(delta, period - delta);
+}
+
+function chooseBackFacingOuterSeam(boundaries, pocketCenters, shaftRadius, circumference) {
+  const blockedIntervals = boundaries
+    .map((boundary, idx) => {
+      const loop = unwrapBoundaryAroundCenter(boundary, pocketCenters[idx], 0, circumference);
+      const bounds = computeBoundaryBounds(loop);
+      return [bounds.sMin, bounds.sMax];
+    });
+
+  const gaps = complementIntervals(blockedIntervals, 0, circumference);
+  if (gaps.length === 0) {
+    return chooseOuterSurfaceSeam(pocketCenters, circumference);
+  }
+
+  const defaultViewTheta = Math.atan2(2.15, 2.55);
+  const hiddenTheta = (defaultViewTheta + Math.PI) % TWO_PI;
+  const preferredS = shaftRadius * hiddenTheta;
+
+  let bestSeam = null;
+  let bestDistance = Infinity;
+  for (const [gapStart, gapEnd] of gaps) {
+    const gapWidth = gapEnd - gapStart;
+    if (gapWidth <= 1e-9) {
+      continue;
+    }
+
+    const margin = Math.min(gapWidth * 0.2, Math.max(0.5, gapWidth * 0.08));
+    const innerStart = gapStart + Math.min(margin, 0.5 * gapWidth);
+    const innerEnd = gapEnd - Math.min(margin, 0.5 * gapWidth);
+    const candidate = innerStart <= preferredS && preferredS <= innerEnd
+      ? preferredS
+      : midpoint(gapStart, gapEnd);
+    const distance = circularDistance(candidate, preferredS, circumference);
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      bestSeam = candidate;
+    }
+  }
+
+  return bestSeam ?? chooseOuterSurfaceSeam(pocketCenters, circumference);
+}
+
 function midpoint(valueA, valueB) {
   return 0.5 * (valueA + valueB);
 }
@@ -484,7 +537,12 @@ function buildParametricPocketPart(params) {
   const xMax = partParams.axialCenter + 0.5 * partParams.pocketLength + xMargin;
   const pocketCenters = computePocketCenters(partParams);
   const boundaries = patternBoundaries(partParams);
-  const seamStart = chooseOuterSurfaceSeam(pocketCenters, circumference);
+  const seamStart = chooseBackFacingOuterSeam(
+    boundaries,
+    pocketCenters,
+    shaftRadius,
+    circumference,
+  );
 
   const pockets = boundaries.map((boundary, idx) => {
     const bounds = computeBoundaryBounds(boundary);
@@ -527,7 +585,6 @@ function buildParametricPocketPart(params) {
       };
     });
 
-  const secondSeam = chooseSecondaryOuterSeam(outerHoleLoops, seamStart, circumference);
   const outerSurfaces = [
     {
       kind: "trimmed-cylinder",
@@ -536,20 +593,10 @@ function buildParametricPocketPart(params) {
       xMin,
       xMax,
       sStart: seamStart,
-      sEnd: secondSeam,
-      holes: outerHoleLoops.filter((loop) => loop.sMax <= secondSeam + 1e-9).map((loop) => loop.loop),
-    },
-    {
-      kind: "trimmed-cylinder",
-      role: "outer",
-      radius: shaftRadius,
-      xMin,
-      xMax,
-      sStart: secondSeam,
       sEnd: seamStart + circumference,
-      holes: outerHoleLoops.filter((loop) => loop.sMin >= secondSeam - 1e-9).map((loop) => loop.loop),
+      holes: outerHoleLoops.map((loop) => loop.loop),
     },
-  ].filter((surface) => surface.sEnd - surface.sStart > 1e-6);
+  ];
 
   return {
     kind: "parametric-pocket-shaft",
@@ -680,78 +727,113 @@ function unwrapBoundaryAroundCenter(boundary, centerS, seamStart, circumference)
   });
 }
 
-function buildPinnedOuterContour(surface, part) {
-  const xSegments = Math.max(18, Math.round(part.params.meshAxialSamples / 8));
-  const sSegments = Math.max(36, Math.round(part.params.meshAngularSamples / 8));
-  const xValues = buildLinearSamples(surface.xMin, surface.xMax, xSegments + 1);
-  const sValues = mergeSortedSamples([
-    ...buildLinearSamples(surface.sStart, surface.sEnd, sSegments + 1),
-    ...surface.holes.flat().map(([, s]) => s),
-  ]);
-
-  const contour = [];
-
-  xValues.forEach((x) => {
-    contour.push([x, surface.sStart]);
-  });
-  sValues.slice(1).forEach((s) => {
-    contour.push([surface.xMax, s]);
-  });
-  xValues.slice(0, -1).reverse().forEach((x) => {
-    contour.push([x, surface.sEnd]);
-  });
-  sValues.slice(1, -1).reverse().forEach((s) => {
-    contour.push([surface.xMin, s]);
-  });
-
-  return normalizeLoopOrientation(contour, true);
-}
-
-function subdivideTriangulatedSurface(vertices, triangles, rounds) {
-  let currentVertices = vertices.map(([x, s]) => [x, s]);
-  let currentTriangles = triangles.map(([a, b, c]) => [a, b, c]);
-
-  for (let roundIdx = 0; roundIdx < rounds; roundIdx += 1) {
-    const midpointCache = new Map();
-    const nextTriangles = [];
-
-    function midpointIndex(indexA, indexB) {
-      const low = Math.min(indexA, indexB);
-      const high = Math.max(indexA, indexB);
-      const key = `${low}:${high}`;
-      if (midpointCache.has(key)) {
-        return midpointCache.get(key);
-      }
-
-      const vertexA = currentVertices[low];
-      const vertexB = currentVertices[high];
-      const midpoint = [
-        0.5 * (vertexA[0] + vertexB[0]),
-        0.5 * (vertexA[1] + vertexB[1]),
-      ];
-      const newIndex = currentVertices.length;
-      currentVertices.push(midpoint);
-      midpointCache.set(key, newIndex);
-      return newIndex;
-    }
-
-    currentTriangles.forEach(([a, b, c]) => {
-      const ab = midpointIndex(a, b);
-      const bc = midpointIndex(b, c);
-      const ca = midpointIndex(c, a);
-      nextTriangles.push([a, ab, ca]);
-      nextTriangles.push([ab, b, bc]);
-      nextTriangles.push([ca, bc, c]);
-      nextTriangles.push([ab, bc, ca]);
-    });
-
-    currentTriangles = nextTriangles;
+function mergeIntervals(intervals) {
+  const ordered = intervals
+    .filter(([start, end]) => end > start + 1e-9)
+    .sort((left, right) => left[0] - right[0]);
+  if (ordered.length === 0) {
+    return [];
   }
 
-  return {
-    vertices: currentVertices,
-    triangles: currentTriangles,
-  };
+  const merged = [ordered[0].slice()];
+  for (let idx = 1; idx < ordered.length; idx += 1) {
+    const [start, end] = ordered[idx];
+    const last = merged[merged.length - 1];
+    if (start <= last[1] + 1e-9) {
+      last[1] = Math.max(last[1], end);
+    } else {
+      merged.push([start, end]);
+    }
+  }
+  return merged;
+}
+
+function complementIntervals(intervals, start, end) {
+  const merged = mergeIntervals(intervals);
+  const out = [];
+  let cursor = start;
+  for (const [intervalStart, intervalEnd] of merged) {
+    if (intervalStart > cursor + 1e-9) {
+      out.push([cursor, intervalStart]);
+    }
+    cursor = Math.max(cursor, intervalEnd);
+  }
+  if (cursor < end - 1e-9) {
+    out.push([cursor, end]);
+  }
+  return out;
+}
+
+function intersectLoopWithVerticalLine(loop, x) {
+  const cleanLoop = sanitizeBoundaryLoop(loop);
+  const sHits = [];
+
+  for (let idx = 0; idx < cleanLoop.length; idx += 1) {
+    const start = cleanLoop[idx];
+    const end = cleanLoop[(idx + 1) % cleanLoop.length];
+    const [x1, s1] = start;
+    const [x2, s2] = end;
+
+    if (Math.abs(x2 - x1) <= 1e-9) {
+      continue;
+    }
+
+    const low = Math.min(x1, x2);
+    const high = Math.max(x1, x2);
+    if (!(x >= low && x < high)) {
+      continue;
+    }
+
+    const t = (x - x1) / (x2 - x1);
+    if (t < -1e-9 || t > 1 + 1e-9) {
+      continue;
+    }
+    sHits.push(s1 + (s2 - s1) * t);
+  }
+
+  sHits.sort((left, right) => left - right);
+  const intervals = [];
+  for (let idx = 0; idx + 1 < sHits.length; idx += 2) {
+    intervals.push([sHits[idx], sHits[idx + 1]]);
+  }
+  return intervals;
+}
+
+function outerSurfaceFreeIntervalsAtX(surface, x) {
+  const blocked = [];
+  for (const hole of surface.holes) {
+    blocked.push(...intersectLoopWithVerticalLine(hole, x));
+  }
+  return complementIntervals(blocked, surface.sStart, surface.sEnd);
+}
+
+function buildOuterSurfaceXValues(surface, part) {
+  const xSegments = Math.max(26, Math.round(part.params.meshAxialSamples / 5));
+  return mergeSortedSamples([
+    ...buildLinearSamples(surface.xMin, surface.xMax, xSegments + 1),
+    ...surface.holes.flat().map(([x]) => x),
+  ]);
+}
+
+function buildOuterStripBandVertices(xLeft, xRight, leftBand, rightBand, sSegments, part, radius) {
+  const positions = [];
+  const normals = [];
+
+  for (let idx = 0; idx <= sSegments; idx += 1) {
+    const t = sSegments === 0 ? 0 : idx / sSegments;
+    const sLeft = leftBand[0] + (leftBand[1] - leftBand[0]) * t;
+    const sRight = rightBand[0] + (rightBand[1] - rightBand[0]) * t;
+    const leftPoint = shaftPointFromUnwrapped(xLeft, sLeft, part.shaftRadius, radius);
+    const rightPoint = shaftPointFromUnwrapped(xRight, sRight, part.shaftRadius, radius);
+    const leftTheta = sLeft / part.shaftRadius;
+    const rightTheta = sRight / part.shaftRadius;
+
+    positions.push(...leftPoint, ...rightPoint);
+    normals.push(0, Math.cos(leftTheta), Math.sin(leftTheta));
+    normals.push(0, Math.cos(rightTheta), Math.sin(rightTheta));
+  }
+
+  return { positions, normals };
 }
 
 // Display stage: tessellate each analytic surface separately to preserve hard breaks.
@@ -824,37 +906,77 @@ function meshTrimmedCylinderSurface(surface, part) {
 }
 
 function meshOuterCylinderSurface(surface, part) {
-  const contour = buildPinnedOuterContour(surface, part);
-  const holes = surface.holes.map((hole) => normalizeLoopOrientation(hole, false));
-
-  const contourShape = contour.map(([x, s]) => new THREE.Vector2(x, s));
-  const holeShapes = holes.map((hole) => hole.map(([x, s]) => new THREE.Vector2(x, s)));
-  const baseTriangles = THREE.ShapeUtils.triangulateShape(contourShape, holeShapes);
-  const baseVertices = [contour, ...holes].flat();
-  const refinementRounds = part.params.meshAngularSamples >= 360 ? 2 : 1;
-  const refined = subdivideTriangulatedSurface(baseVertices, baseTriangles, refinementRounds);
-  const positions = new Float32Array(refined.vertices.length * 3);
-  const normals = new Float32Array(refined.vertices.length * 3);
-
-  refined.vertices.forEach(([x, s], idx) => {
-    const point = shaftPointFromUnwrapped(x, s, part.shaftRadius, surface.radius);
-    const theta = s / part.shaftRadius;
-    positions[idx * 3 + 0] = point[0];
-    positions[idx * 3 + 1] = point[1];
-    positions[idx * 3 + 2] = point[2];
-    normals[idx * 3 + 0] = 0;
-    normals[idx * 3 + 1] = Math.cos(theta);
-    normals[idx * 3 + 2] = Math.sin(theta);
-  });
-
+  const xValues = buildOuterSurfaceXValues(surface, part);
+  const positions = [];
+  const normals = [];
   const indices = [];
-  refined.triangles.forEach(([a, b, c]) => {
-    indices.push(a, c, b);
-  });
+  let vertexBase = 0;
+
+  for (let stripIdx = 0; stripIdx < xValues.length - 1; stripIdx += 1) {
+    const xLeft = xValues[stripIdx];
+    const xRight = xValues[stripIdx + 1];
+    const stripWidth = xRight - xLeft;
+    if (stripWidth <= 1e-9) {
+      continue;
+    }
+
+    const epsilon = Math.min(1e-5, stripWidth * 0.25);
+    const leftEval = Math.min(xRight - 1e-9, xLeft + epsilon);
+    const rightEval = Math.max(xLeft + 1e-9, xRight - epsilon);
+    const midEval = 0.5 * (xLeft + xRight);
+
+    let leftBands = outerSurfaceFreeIntervalsAtX(surface, leftEval);
+    let rightBands = outerSurfaceFreeIntervalsAtX(surface, rightEval);
+    const midBands = outerSurfaceFreeIntervalsAtX(surface, midEval);
+
+    if (midBands.length === 0) {
+      continue;
+    }
+
+    if (leftBands.length !== midBands.length) {
+      leftBands = midBands.map((band) => [...band]);
+    }
+    if (rightBands.length !== midBands.length) {
+      rightBands = midBands.map((band) => [...band]);
+    }
+
+    const bandCount = Math.min(leftBands.length, rightBands.length, midBands.length);
+    for (let bandIdx = 0; bandIdx < bandCount; bandIdx += 1) {
+      const leftBand = leftBands[bandIdx];
+      const rightBand = rightBands[bandIdx];
+      const width = Math.max(leftBand[1] - leftBand[0], rightBand[1] - rightBand[0]);
+      if (width <= 1e-9) {
+        continue;
+      }
+
+      const sSegments = sampleCountForSpan(width, part.circumference, part.params.meshAngularSamples, 3);
+      const strip = buildOuterStripBandVertices(
+        xLeft,
+        xRight,
+        leftBand,
+        rightBand,
+        sSegments,
+        part,
+        surface.radius,
+      );
+
+      positions.push(...strip.positions);
+      normals.push(...strip.normals);
+
+      for (let segIdx = 0; segIdx < sSegments; segIdx += 1) {
+        const a = vertexBase + segIdx * 2;
+        const b = a + 1;
+        const c = a + 2;
+        const d = a + 3;
+        indices.push(a, c, b, b, c, d);
+      }
+      vertexBase += (sSegments + 1) * 2;
+    }
+  }
 
   const geometry = new THREE.BufferGeometry();
-  geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
-  geometry.setAttribute("normal", new THREE.BufferAttribute(normals, 3));
+  geometry.setAttribute("position", new THREE.BufferAttribute(new Float32Array(positions), 3));
+  geometry.setAttribute("normal", new THREE.BufferAttribute(new Float32Array(normals), 3));
   geometry.setIndex(indices);
   geometry.computeBoundingBox();
   geometry.computeBoundingSphere();
@@ -1005,6 +1127,24 @@ function meshParametricPocketPart(part) {
 
 function formatValue(value, decimals = 2) {
   return Number(value).toFixed(decimals).replace(/\.?0+$/, "");
+}
+
+function buildFinishMaterial(role, finish) {
+  const presets = {
+    matte: {
+      outer: { color: 0xb8c3cb, metalness: 0.28, roughness: 0.72, envMapIntensity: 0.65 },
+      pocket: { color: 0xa9b8c2, metalness: 0.24, roughness: 0.76, envMapIntensity: 0.6 },
+      endcap: { color: 0xb4c0c8, metalness: 0.26, roughness: 0.7, envMapIntensity: 0.62 },
+    },
+    shiny: {
+      outer: { color: 0xb8c3cb, metalness: 0.8, roughness: 0.16, envMapIntensity: 1.0 },
+      pocket: { color: 0xa9b8c2, metalness: 0.74, roughness: 0.22, envMapIntensity: 1.0 },
+      endcap: { color: 0xb4c0c8, metalness: 0.72, roughness: 0.2, envMapIntensity: 0.98 },
+    },
+  };
+
+  const family = presets[finish] ?? presets.matte;
+  return new THREE.MeshStandardMaterial(family[role]);
 }
 
 class CylindricalOblongPocketViewer extends HTMLElement {
@@ -1229,6 +1369,20 @@ class CylindricalOblongPocketViewer extends HTMLElement {
           font: inherit;
         }
 
+        select {
+          width: 100%;
+          padding: 9px 10px;
+          border-radius: 12px;
+          border: 1px solid rgba(255, 255, 255, 0.1);
+          background: rgba(255, 255, 255, 0.05);
+          color: #f8f8f3;
+          font: inherit;
+        }
+
+        .control-body.single {
+          grid-template-columns: 1fr;
+        }
+
         .toggles {
           display: grid;
           gap: 12px;
@@ -1409,6 +1563,32 @@ class CylindricalOblongPocketViewer extends HTMLElement {
               </label>
             </section>
 
+            <section class="panel-section">
+              <div class="section-kicker">Surface Finish</div>
+              <label class="control">
+                <span class="control-head">
+                  <span>Outer Shell</span>
+                  <span class="unit">appearance</span>
+                </span>
+                <div class="control-body single">
+                  <select data-kind="select" data-key="outerFinish">
+                    ${FINISH_OPTIONS.map((option) => `<option value="${option.value}">${option.label}</option>`).join("")}
+                  </select>
+                </div>
+              </label>
+              <label class="control">
+                <span class="control-head">
+                  <span>Pocket Walls + Floor</span>
+                  <span class="unit">appearance</span>
+                </span>
+                <div class="control-body single">
+                  <select data-kind="select" data-key="pocketFinish">
+                    ${FINISH_OPTIONS.map((option) => `<option value="${option.value}">${option.label}</option>`).join("")}
+                  </select>
+                </div>
+              </label>
+            </section>
+
             <section class="stats">
               <span class="stats-title">Live Metrics</span>
               <dl class="stat">
@@ -1506,6 +1686,14 @@ class CylindricalOblongPocketViewer extends HTMLElement {
         return;
       }
 
+      if (input.dataset.kind === "select") {
+        input.addEventListener("change", () => {
+          this._params[key] = input.value;
+          this._scheduleRebuild();
+        });
+        return;
+      }
+
       if (input.dataset.kind === "range") {
         input.addEventListener("input", () => {
           this._applyNumericInput(key, Number(input.value), true);
@@ -1555,6 +1743,9 @@ class CylindricalOblongPocketViewer extends HTMLElement {
       if (pair.toggle) {
         pair.toggle.checked = Boolean(this._params[key]);
       }
+      if (pair.select) {
+        pair.select.value = String(this._params[key]);
+      }
     });
   }
 
@@ -1594,30 +1785,10 @@ class CylindricalOblongPocketViewer extends HTMLElement {
       const cadPart = buildParametricPocketPart(this._params);
       const shaftRadius = cadPart.shaftRadius;
       const materials = {
-        outer: new THREE.MeshStandardMaterial({
-          color: 0xb8c3cb,
-          metalness: 0.8,
-          roughness: 0.16,
-          envMapIntensity: 1.0,
-        }),
-        floor: new THREE.MeshStandardMaterial({
-          color: 0xa9b8c2,
-          metalness: 0.74,
-          roughness: 0.22,
-          envMapIntensity: 1.0,
-        }),
-        wall: new THREE.MeshStandardMaterial({
-          color: 0x9eafbb,
-          metalness: 0.68,
-          roughness: 0.26,
-          envMapIntensity: 0.95,
-        }),
-        endcap: new THREE.MeshStandardMaterial({
-          color: 0xb4c0c8,
-          metalness: 0.72,
-          roughness: 0.2,
-          envMapIntensity: 0.98,
-        }),
+        outer: buildFinishMaterial("outer", this._params.outerFinish),
+        floor: buildFinishMaterial("pocket", this._params.pocketFinish),
+        wall: buildFinishMaterial("pocket", this._params.pocketFinish),
+        endcap: buildFinishMaterial("endcap", this._params.outerFinish),
       };
 
       meshParametricPocketPart(cadPart).forEach(({ role, geometry }) => {
